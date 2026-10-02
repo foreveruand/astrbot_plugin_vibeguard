@@ -1,0 +1,48 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "是否启用敏感词脱敏替换",
+    "default": true
+  },
+  "sensitive_words": {
+    "type": "list",
+    "description": "自定义敏感词列表，精确匹配并替换",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  },
+  "sensitive_patterns": {
+    "type": "list",
+    "description": "正则表达式模式列表，用于匹配符合特定格式的敏感信息（例如 API Key、手机号、Token 等）",
+    "default": [
+      "sk-[a-zA-Z0-9_-]{20,}",
+      "\\b1[3-9]\\d{9}\\b",
+      "ghp_[a-zA-Z0-9]{36}"
+    ],
+    "items": {
+      "type": "string"
+    }
+  },
+  "token_ttl_seconds": {
+    "type": "int",
+    "description": "替换映射缓存有效期（秒）。在有效期内，同一敏感词复用相同的占位符，利于 LLM 缓存命中。每次请求命中会刷新有效时间。",
+    "default": 3600,
+    "hint": "默认 3600 秒（1 小时）"
+  },
+  "placeholder_prefix": {
+    "type": "string",
+    "description": "占位符前缀",
+    "default": "__VG_"
+  },
+  "placeholder_suffix": {
+    "type": "string",
+    "description": "占位符后缀",
+    "default": "__"
+  },
+  "replace_in_contexts": {
+    "type": "bool",
+    "description": "是否同时脱敏发往 LLM 的历史上下文中的敏感词",
+    "default": true
+  }
+}
