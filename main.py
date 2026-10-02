@@ -4,6 +4,8 @@ import copy
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import Message, TextPart
+from astrbot.core.message.components import Plain
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
 from .replacer import SensitiveReplacer
@@ -150,6 +152,97 @@ class VibeGuardPlugin(Star):
                     TextPart(text=f"\n\n{notice_text}").mark_as_temp()
                 )
 
+        # 6. Wrap streaming delivery so placeholders split across chunks
+        # are still restored before reaching the user.
+        # Background: on_llm_response only runs once at agent completion,
+        # while streaming deltas (MessageChain chunks) are sent to the
+        # platform via event.send_streaming BEFORE that hook. Without this
+        # wrapper, platforms using streaming (e.g. weixin_oc with default
+        # realtime_segmenting, which aggregates deltas) would show raw
+        # placeholders to the user, even though DB history (fixed in
+        # on_agent_done) looks correct.
+        if replaced_any:
+            self._wrap_send_streaming(event)
+
+    def _wrap_send_streaming(self, event: AstrMessageEvent) -> None:
+        """Install a per-turn send_streaming wrapper that restores placeholders.
+
+        Args:
+            event: Current turn message event.
+        """
+        if not self.replacer:
+            return
+        if event.get_extra("_vg_stream_wrapped"):
+            return
+        event.set_extra("_vg_stream_wrapped", True)
+
+        orig_send_streaming = event.send_streaming
+        replacer = self.replacer
+        logger = self.logger
+
+        async def _restored_generator(generator):
+            texts: list[str] = []
+            reasoning_texts: list[str] = []
+            passthrough: list = []
+            try:
+                async for chain in generator:
+                    if chain is None:
+                        continue
+                    ctype = getattr(chain, "type", None)
+                    chain_list = getattr(chain, "chain", None) or []
+                    if ctype == "break" or not chain_list:
+                        continue
+                    if ctype == "reasoning":
+                        for comp in chain_list:
+                            if isinstance(comp, Plain):
+                                reasoning_texts.append(comp.text or "")
+                            else:
+                                passthrough.append(comp)
+                        continue
+                    has_plain = any(isinstance(c, Plain) for c in chain_list)
+                    if not has_plain:
+                        passthrough.append(chain)
+                        continue
+                    for comp in chain_list:
+                        if isinstance(comp, Plain):
+                            texts.append(comp.text or "")
+                        else:
+                            passthrough.append(comp)
+            except Exception as e:
+                logger.warning(f"VibeGuard streaming collect failed: {e}")
+
+            # Restore after full collection so placeholders split
+            # across chunk boundaries are joined before replacement.
+            if reasoning_texts:
+                try:
+                    restored_r = await replacer.restore_text("".join(reasoning_texts))
+                except Exception as e:
+                    logger.warning(f"VibeGuard reasoning restore failed: {e}")
+                    restored_r = "".join(reasoning_texts)
+                if restored_r:
+                    yield MessageChain(type="reasoning").message(restored_r)
+            for item in passthrough:
+                if hasattr(item, "chain"):
+                    yield item
+                else:
+                    yield MessageChain(chain=[item])
+            if texts:
+                full = "".join(texts)
+                try:
+                    restored = await replacer.restore_text(full)
+                except Exception as e:
+                    logger.warning(f"VibeGuard streaming restore failed: {e}")
+                    restored = full
+                if restored:
+                    yield MessageChain().message(restored)
+
+        async def _vg_send_streaming(generator, use_fallback: bool = False):
+            return await orig_send_streaming(
+                _restored_generator(generator), use_fallback
+            )
+
+        event.send_streaming = _vg_send_streaming  # type: ignore[method-assign]
+
     @filter.on_llm_response(priority=100)
     async def on_llm_response(
         self, event: AstrMessageEvent, response: LLMResponse
@@ -163,19 +256,20 @@ class VibeGuardPlugin(Star):
         if not self.config.get("enabled", True) or not self.replacer:
             return
 
-        # 1. Restore completion_text via result_chain
+        # 1. Restore result_chain Plain parts. When result_chain exists,
+        # completion_text property reads from it, so fixing parts is enough.
         if response.result_chain:
             for comp in response.result_chain.chain:
                 if hasattr(comp, "text") and isinstance(comp.text, str):
                     comp.text = await self.replacer.restore_text(comp.text)
-
-        # 2. Also restore raw completion text if available
-        if (
+        elif (
             hasattr(response, "_completion_text")
             and response._completion_text
             and isinstance(response._completion_text, str)
         ):
-            response._completion_text = await self.replacer.restore_text(
+            # 2. No result_chain: restore via property setter to keep
+            # _completion_text and chain in sync.
+            response.completion_text = await self.replacer.restore_text(
                 response._completion_text
             )
 
@@ -184,6 +278,53 @@ class VibeGuardPlugin(Star):
             response.reasoning_content = await self.replacer.restore_text(
                 response.reasoning_content
             )
+
+        # 4. MainAgentHooks copies reasoning into event extra BEFORE this
+        # hook runs, so the queued copy would stay masked. Restore it too,
+        # otherwise ResultDecorateStage injects masked reasoning to user.
+        try:
+            extra_reasoning = event.get_extra("_llm_reasoning_content")
+        except Exception:
+            extra_reasoning = None
+        if isinstance(extra_reasoning, str) and extra_reasoning:
+            try:
+                event.set_extra(
+                    "_llm_reasoning_content",
+                    await self.replacer.restore_text(extra_reasoning),
+                )
+            except Exception as e:
+                self.logger.warning(f"VibeGuard reasoning extra restore failed: {e}")
+
+    @filter.on_decorating_result(priority=100)
+    async def on_decorating_result(self, event: AstrMessageEvent) -> None:
+        """Final safety net: restore any placeholders in outbound result.
+
+        Covers non-streaming results built from LLMResponse after
+        on_llm_response, plus any other path that forwards masked text.
+        Streaming delivery is handled separately by the send_streaming
+        wrapper, since ResultDecorateStage skips this hook for
+        STREAMING_RESULT.
+
+        Args:
+            event: AstrMessageEvent context.
+        """
+        if not self.config.get("enabled", True) or not self.replacer:
+            return
+        try:
+            result = event.get_result()
+        except Exception:
+            return
+        if result is None or not getattr(result, "chain", None):
+            return
+        for comp in result.chain:
+            try:
+                if isinstance(comp, Plain):
+                    if comp.text:
+                        comp.text = await self.replacer.restore_text(comp.text)
+                elif hasattr(comp, "text") and isinstance(comp.text, str) and comp.text:
+                    comp.text = await self.replacer.restore_text(comp.text)
+            except Exception as e:
+                self.logger.warning(f"VibeGuard result restore failed: {e}")
 
     @filter.on_agent_done(priority=100)
     async def on_agent_done(
