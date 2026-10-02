@@ -22,6 +22,8 @@
 | `token_ttl_seconds` | int | `3600` | 占位符映射缓存过期时间（秒），每次命中刷新 |
 | `placeholder_prefix` | string | `__VG_` | 占位符前缀 |
 | `placeholder_suffix` | string | `__` | 占位符后缀 |
+| `inject_guard_notice` | bool | `true` | 是否在存在脱敏占位符时注入提示词说明，避免模型误认乱码 |
+| `guard_notice_text` | text | `[Notice: Strings matching __VG_*__ are security redaction placeholders...]` | 注入的提示词说明模板 |
 | `replace_in_contexts` | bool | `true` | 是否在发往 LLM 的历史上下文中同样执行脱敏 |
 
 ## 授权许可

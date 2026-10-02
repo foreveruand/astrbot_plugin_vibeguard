@@ -3,7 +3,7 @@ import copy
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
-from astrbot.core.agent.message import Message
+from astrbot.core.agent.message import Message, TextPart
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
 from .replacer import SensitiveReplacer
@@ -92,8 +92,12 @@ class VibeGuardPlugin(Star):
         event.set_extra("_vg_original_prompt", req.prompt)
 
         # 2. Replace sensitive words in current user prompt
+        replaced_any = False
         if req.prompt:
+            original_p = req.prompt
             req.prompt = await self.replacer.replace_text(req.prompt)
+            if req.prompt != original_p:
+                replaced_any = True
 
         # 3. Replace in extra user content parts if present
         if req.extra_user_content_parts:
@@ -103,11 +107,15 @@ class VibeGuardPlugin(Star):
                     and part.type == "text"
                     and hasattr(part, "text")
                 ):
+                    orig_text = part.text
                     part.text = await self.replacer.replace_text(part.text)
+                    if part.text != orig_text:
+                        replaced_any = True
                 elif isinstance(part, dict) and part.get("type") == "text":
-                    part["text"] = await self.replacer.replace_text(
-                        part.get("text", "")
-                    )
+                    orig_text = part.get("text", "")
+                    part["text"] = await self.replacer.replace_text(orig_text)
+                    if part["text"] != orig_text:
+                        replaced_any = True
 
         # 4. Replace in prior conversation contexts sent to LLM
         if self.config.get("replace_in_contexts", True) and req.contexts:
@@ -116,13 +124,31 @@ class VibeGuardPlugin(Star):
             for ctx in req.contexts:
                 content = ctx.get("content")
                 if isinstance(content, str):
-                    ctx["content"] = await self.replacer.replace_text(content)
+                    replaced_content = await self.replacer.replace_text(content)
+                    if replaced_content != content:
+                        replaced_any = True
+                    ctx["content"] = replaced_content
                 elif isinstance(content, list):
                     for sub in content:
                         if isinstance(sub, dict) and sub.get("type") == "text":
-                            sub["text"] = await self.replacer.replace_text(
-                                sub.get("text", "")
-                            )
+                            sub_text = sub.get("text", "")
+                            replaced_sub = await self.replacer.replace_text(sub_text)
+                            if replaced_sub != sub_text:
+                                replaced_any = True
+                            sub["text"] = replaced_sub
+
+        # 5. Inject guard explanation notice if any placeholder was substituted
+        if replaced_any and self.config.get("inject_guard_notice", True):
+            notice_text = self.config.get(
+                "guard_notice_text",
+                "[Notice: Strings matching __VG_*__ are security redaction placeholders for sensitive credentials/data. Treat them as valid opaque identifiers and keep them intact when referencing.]",
+            )
+            if notice_text:
+                # Append as a temporary extra content part marked with mark_as_temp()
+                # so it is transmitted to the LLM but stripped before database history saving
+                req.extra_user_content_parts.append(
+                    TextPart(text=f"\n\n{notice_text}").mark_as_temp()
+                )
 
     @filter.on_llm_response(priority=100)
     async def on_llm_response(

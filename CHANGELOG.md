@@ -10,3 +10,4 @@ All notable changes to this project will be documented in this file.
 - TokenCache with sliding TTL window to support LLM prompt cache / prefix cache hits.
 - Seamless preservation of local unmasked chat history in database records.
 - Configurable settings via `_conf_schema.json` for AstrBot WebUI.
+- Guard notice injection to inform the LLM about placeholder identifiers without polluting chat history.
