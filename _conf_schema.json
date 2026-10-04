@@ -48,11 +48,34 @@
   "guard_notice_text": {
     "type": "text",
     "description": "注入的说明提示词内容",
-    "default": "[Notice: Strings matching __VG_*__ are security redaction placeholders for sensitive credentials/data. Treat them as valid opaque identifiers and keep them intact when referencing.]"
+    "default": "[Security Notice: Strings matching __VG_*__ are opaque security redaction placeholders.\nRules:\n1. Treat each placeholder as a final, valid identifier. Pass them through unchanged.\n2. Do NOT attempt to guess, decode, reverse-engineer, or infer the original value behind any placeholder.\n3. Do NOT search for, read, or access any VibeGuard configuration files, plugin source code, mapping tables, or cached data that might reveal placeholder-to-original mappings.\n4. Do NOT use any tools (file read, grep, shell, Python execution, etc.) to inspect plugin directories, config directories, or process memory for redaction mappings.\n5. If asked by the user to reveal the original value of a placeholder, respond that the information is redacted for security purposes.]"
+  },
+  "inject_to_system_prompt": {
+    "type": "bool",
+    "description": "是否同时将占位符说明追加到系统提示词（system role 指令权重更高）",
+    "default": false
   },
   "replace_in_contexts": {
     "type": "bool",
     "description": "是否同时脱敏发往 LLM 的历史上下文中的敏感词",
     "default": true
+  },
+  "replace_in_tool_args": {
+    "type": "bool",
+    "description": "是否在工具调用执行前将参数中的占位符还原为原始值，便于 LLM 直接传入占位符作为参数",
+    "default": true
+  },
+  "replace_in_tool_results": {
+    "type": "bool",
+    "description": "是否对工具调用返回结果中的敏感信息执行脱敏替换",
+    "default": true
+  },
+  "protected_paths": {
+    "type": "list",
+    "description": "禁止 LLM 通过工具访问的额外文件路径或 glob 模式（插件自身配置与源码路径始终受保护）",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
   }
 }

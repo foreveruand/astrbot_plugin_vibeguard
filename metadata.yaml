@@ -1,6 +1,6 @@
 name: astrbot_plugin_vibeguard
 display_name: VibeGuard
 desc: 保护敏感数据，自动对发往 LLM 的敏感词与密钥进行脱敏替换并缓存，接收回复后无缝还原，本地对话历史保留原文。
-version: v1.0.1
+version: v1.1.0
 author: foreveruand
 repo: https://github.com/foreveruand/astrbot_plugin_vibeguard

@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import fnmatch
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
@@ -143,7 +144,8 @@ class VibeGuardPlugin(Star):
         if replaced_any and self.config.get("inject_guard_notice", True):
             notice_text = self.config.get(
                 "guard_notice_text",
-                "[Notice: Strings matching __VG_*__ are security redaction placeholders for sensitive credentials/data. Treat them as valid opaque identifiers and keep them intact when referencing.]",
+                "[Security Notice: Strings matching __VG_*__ are opaque security "
+                "redaction placeholders.]",
             )
             if notice_text:
                 # Append as a temporary extra content part marked with mark_as_temp()
@@ -151,6 +153,17 @@ class VibeGuardPlugin(Star):
                 req.extra_user_content_parts.append(
                     TextPart(text=f"\n\n{notice_text}").mark_as_temp()
                 )
+                # Optionally mirror the notice into the system prompt, where
+                # instruction weight is usually higher than in user content.
+                if self.config.get("inject_to_system_prompt", False):
+                    try:
+                        req.system_prompt = (
+                            f"{req.system_prompt or ''}\n\n{notice_text}"
+                        )
+                    except Exception as e:
+                        self.logger.warning(
+                            f"VibeGuard system prompt injection failed: {e}"
+                        )
 
         # 6. Wrap streaming delivery so placeholders split across chunks
         # are still restored before reaching the user.
@@ -242,6 +255,218 @@ class VibeGuardPlugin(Star):
             )
 
         event.send_streaming = _vg_send_streaming  # type: ignore[method-assign]
+
+    @filter.on_using_llm_tool(priority=100)
+    async def on_using_llm_tool(
+        self, event: AstrMessageEvent, tool, tool_args: dict | None
+    ) -> None:
+        """Intercept tool calls: block protected paths and restore placeholders.
+
+        AstrBot passes ``tool_args`` (valid_params) by reference, so in-place
+        mutation takes effect on the actual tool execution. Exceptions raised
+        here are swallowed by the agent runner, so blocking is implemented by
+        rewriting arguments into harmless values instead of raising.
+
+        Args:
+            event: AstrMessageEvent context.
+            tool: The FunctionTool about to be executed.
+            tool_args: Mutable tool arguments dict.
+        """
+        if not self.config.get("enabled", True) or not self.replacer:
+            return
+        if not tool_args:
+            return
+
+        tool_name = getattr(tool, "name", "") or ""
+        blocked = self._guard_tool_path_access(tool_name, tool_args)
+        if blocked:
+            return
+
+        if self.config.get("replace_in_tool_args", True):
+            try:
+                await self._restore_tool_args(tool_args)
+            except Exception as e:
+                self.logger.warning(f"VibeGuard tool args restore failed: {e}")
+
+    @filter.on_llm_tool_respond(priority=100)
+    async def on_llm_tool_respond(
+        self, event: AstrMessageEvent, tool, tool_args: dict | None, tool_result
+    ) -> None:
+        """Mask sensitive data found in tool execution results.
+
+        Note: AstrBot appends the tool result text to the agent loop context
+        BEFORE dispatching this hook, so in-loop masking via this hook is
+        best-effort only. It still protects downstream consumers of the
+        result object, and persisted history is handled in on_agent_done.
+        Cross-turn protection comes from replace_in_contexts masking when
+        tool outputs re-enter the LLM as history contexts.
+
+        Args:
+            event: AstrMessageEvent context.
+            tool: The FunctionTool that was executed.
+            tool_args: Original tool arguments.
+            tool_result: CallToolResult (or None) returned by the tool.
+        """
+        if not self.config.get("enabled", True) or not self.replacer:
+            return
+        if not self.config.get("replace_in_tool_results", True):
+            return
+        if tool_result is None:
+            return
+        try:
+            content = getattr(tool_result, "content", None)
+            if isinstance(content, list):
+                for item in content:
+                    await self._mask_result_item(item)
+            elif isinstance(tool_result, str):
+                self.logger.debug("VibeGuard got str tool result; nothing to mutate.")
+        except Exception as e:
+            self.logger.warning(f"VibeGuard tool result masking failed: {e}")
+
+    async def _mask_result_item(self, item) -> None:
+        """Mask sensitive text inside a single tool result content item.
+
+        Args:
+            item: A result content item (TextContent-like or EmbeddedResource-like).
+        """
+        text = getattr(item, "text", None)
+        if isinstance(text, str) and text:
+            masked = await self.replacer.replace_text(text)
+            if masked != text:
+                item.text = masked
+            return
+        resource = getattr(item, "resource", None)
+        resource_text = getattr(resource, "text", None)
+        if isinstance(resource_text, str) and resource_text:
+            masked = await self.replacer.replace_text(resource_text)
+            if masked != resource_text:
+                resource.text = masked
+
+    async def _restore_tool_args(self, obj) -> None:
+        """Recursively restore placeholders in tool args to original values.
+
+        Mutates dicts and lists in place so the tool executes with real values.
+
+        Args:
+            obj: Tool args dict, list, or nested structure to restore.
+        """
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(value, str):
+                    restored = await self.replacer.restore_text(value)
+                    if restored != value:
+                        obj[key] = restored
+                elif isinstance(value, (dict, list)):
+                    await self._restore_tool_args(value)
+        elif isinstance(obj, list):
+            for index, item in enumerate(obj):
+                if isinstance(item, str):
+                    restored = await self.replacer.restore_text(item)
+                    if restored != item:
+                        obj[index] = restored
+                elif isinstance(item, (dict, list)):
+                    await self._restore_tool_args(item)
+
+    def _is_protected_target(self, value: str) -> bool:
+        """Check whether a path or command string targets protected locations.
+
+        Always protects the plugin config file and plugin source directory
+        (except skills subdirectories). User-configured protected_paths
+        entries are matched as substrings or glob patterns.
+
+        Args:
+            value: Path or command string to inspect.
+
+        Returns:
+            True if the value targets a protected location.
+        """
+        if not value or not isinstance(value, str):
+            return False
+        lowered = value.lower()
+        if "astrbot_plugin_vibeguard_config" in lowered:
+            return True
+        if "astrbot_plugin_vibeguard" in lowered and "skills" not in lowered:
+            return True
+        for entry in self.config.get("protected_paths", []) or []:
+            if not isinstance(entry, str) or not entry.strip():
+                continue
+            pattern = entry.strip()
+            if pattern in value:
+                return True
+            try:
+                if fnmatch.fnmatch(value, pattern) or fnmatch.fnmatch(
+                    lowered, pattern.lower()
+                ):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _guard_tool_path_access(self, tool_name: str, tool_args: dict) -> bool:
+        """Rewrite tool args to block access to protected paths.
+
+        Args:
+            tool_name: Name of the tool about to be executed.
+            tool_args: Mutable tool arguments dict.
+
+        Returns:
+            True if access was blocked (args rewritten), False otherwise.
+        """
+        denied_notice = (
+            "[VibeGuard] Access denied: this path is restricted by VibeGuard."
+        )
+        if tool_name in (
+            "astrbot_file_read_tool",
+            "astrbot_file_write_tool",
+            "astrbot_file_edit_tool",
+        ):
+            path = tool_args.get("path", "")
+            if self._is_protected_target(path):
+                self.logger.warning(
+                    f"VibeGuard blocked {tool_name} access to protected path."
+                )
+                tool_args["path"] = ""
+                return True
+            return False
+        if tool_name == "astrbot_grep_tool":
+            path = tool_args.get("path", "")
+            if path and self._is_protected_target(path):
+                self.logger.warning(
+                    "VibeGuard blocked astrbot_grep_tool access to protected path."
+                )
+                tool_args["path"] = ""
+                return True
+            return False
+        if tool_name == "astrbot_execute_shell":
+            command = tool_args.get("command", "")
+            if self._is_protected_target(command):
+                self.logger.warning(
+                    "VibeGuard blocked astrbot_execute_shell targeting protected path."
+                )
+                tool_args["command"] = f"echo '{denied_notice}'"
+                return True
+            return False
+        if tool_name == "astrbot_shell_session":
+            action = tool_args.get("action", "")
+            if action in ("write", "write_line") and self._is_protected_target(
+                tool_args.get("chars", "")
+            ):
+                self.logger.warning(
+                    "VibeGuard blocked astrbot_shell_session write targeting protected path."
+                )
+                tool_args["chars"] = ""
+                return True
+            return False
+        if tool_name in ("astrbot_execute_python", "astrbot_execute_ipython"):
+            code = tool_args.get("code", "")
+            if self._is_protected_target(code):
+                self.logger.warning(
+                    f"VibeGuard blocked {tool_name} targeting protected path."
+                )
+                tool_args["code"] = f"print('{denied_notice}')"
+                return True
+            return False
+        return False
 
     @filter.on_llm_response(priority=100)
     async def on_llm_response(
@@ -381,6 +606,20 @@ class VibeGuardPlugin(Star):
                                 part.text = await self.replacer.restore_text(part.text)
             elif msg.role == "assistant":
                 # Ensure assistant message saved in DB has no lingering placeholders
+                if isinstance(msg.content, str):
+                    msg.content = await self.replacer.restore_text(msg.content)
+                elif isinstance(msg.content, list):
+                    for part in msg.content:
+                        if (
+                            hasattr(part, "type")
+                            and part.type == "text"
+                            and hasattr(part, "text")
+                        ):
+                            part.text = await self.replacer.restore_text(part.text)
+            elif msg.role == "tool":
+                # Tool result blocks may echo placeholders back (e.g. a tool
+                # echoing its own arguments). Restore them so persisted
+                # history stays genuine and unmasked.
                 if isinstance(msg.content, str):
                     msg.content = await self.replacer.restore_text(msg.content)
                 elif isinstance(msg.content, list):
